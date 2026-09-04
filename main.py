@@ -4,7 +4,7 @@ Fireflies webhook receiver + transcript writer.
 Flow: Fireflies POSTs to /webhook when a meeting's transcript is ready ->
 verify the request is genuinely from Fireflies (HMAC-SHA256 over the raw
 body, using FIREFLIES_WEBHOOK_SECRET) -> pull the full transcript via their
-GraphQL API -> map it onto the interview_transcripts schema (source='online')
+GraphQL API -> map it onto the drt.ta_interview_transcript schema (source='online')
 -> insert one row per sentence.
 
 Deployed at /data/shared/Rudhi_P1/pace/transcript/ on the aterp server,
@@ -139,7 +139,7 @@ def write_transcript_rows(transcript: dict, meeting_id: str) -> dict:
         raise RuntimeError(f"Transcript for meeting_id={meeting_id} has no sentences")
 
     insert_sql = """
-        INSERT INTO interview_transcripts (
+        INSERT INTO drt.ta_interview_transcript (
             transcript_id, source, meeting_date, meeting_link, meeting_name,
             interviewer_name, candidate_name, segment_start, segment_end,
             speaker, text, avg_logprob, needs_review, flag_reason,
