@@ -54,6 +54,13 @@ def health_check():
     return {"status": "ok", "message": "Fireflies webhook receiver is running"}
 
 
+@app.head("/")
+def health_check_head():
+    # Render's own probe and some uptime monitors use HEAD instead of GET -
+    # FastAPI doesn't auto-derive HEAD from a GET route, so this was 405ing.
+    return
+
+
 def verify_signature(raw_body: bytes, signature_header: str) -> bool:
     if not signature_header:
         return False
