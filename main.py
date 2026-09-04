@@ -60,8 +60,13 @@ def verify_signature(raw_body: bytes, signature_header: str) -> bool:
     computed = hmac.new(
         FIREFLIES_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256
     ).hexdigest()
+    # Fireflies sends the header as "sha256=<hex>" (v2 docs, confirmed) - strip the
+    # prefix before comparing, or every real webhook would fail signature checks.
+    received = signature_header
+    if received.startswith("sha256="):
+        received = received[len("sha256="):]
     # constant-time compare - avoid leaking timing info about the correct signature
-    return hmac.compare_digest(computed, signature_header)
+    return hmac.compare_digest(computed, received)
 
 
 TRANSCRIPT_QUERY = """
@@ -182,18 +187,20 @@ async def receive_webhook(request: Request):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     payload = await request.json()
-    event_type = payload.get("eventType")
-    meeting_id = payload.get("meetingId")
+    # Webhooks V2 payload shape (confirmed against Fireflies' docs):
+    # {"event": "meeting.transcribed", "timestamp": ..., "meeting_id": "...", "client_reference_id": "..."}
+    event_type = payload.get("event")
+    meeting_id = payload.get("meeting_id")
 
-    logger.info(f"Received webhook: eventType={event_type!r} meetingId={meeting_id!r}")
+    logger.info(f"Received webhook: event={event_type!r} meeting_id={meeting_id!r}")
 
-    if event_type != "Transcription completed":
-        logger.info(f"Ignoring event type {event_type!r} - only handling 'Transcription completed'")
-        return {"status": "ignored", "reason": f"unhandled eventType: {event_type}"}
+    if event_type != "meeting.transcribed":
+        logger.info(f"Ignoring event {event_type!r} - only handling 'meeting.transcribed'")
+        return {"status": "ignored", "reason": f"unhandled event: {event_type}"}
 
     if not meeting_id:
-        logger.error("Webhook missing meetingId")
-        raise HTTPException(status_code=400, detail="Missing meetingId")
+        logger.error("Webhook missing meeting_id")
+        raise HTTPException(status_code=400, detail="Missing meeting_id")
 
     try:
         transcript = fetch_transcript(meeting_id)
