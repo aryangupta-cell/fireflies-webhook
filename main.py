@@ -35,6 +35,11 @@ FIREFLIES_API_KEY = os.environ["FIREFLIES_API_KEY"]
 FIREFLIES_WEBHOOK_SECRET = os.environ["FIREFLIES_WEBHOOK_SECRET"]
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
 
+# Set as client_reference_id by the offline upload webpage when it calls Fireflies'
+# uploadAudio mutation, so this receiver can tell an offline file upload apart from
+# a real live Meet call (which never sets client_reference_id).
+OFFLINE_UPLOAD_MARKER_PREFIX = "offline-"
+
 DB_CONFIG = {
     "host": os.environ["DB_HOST"],
     "port": os.environ["DB_PORT"],
@@ -126,7 +131,7 @@ def parse_meeting_date(date_string: str):
         return datetime.now(timezone.utc).date().isoformat()
 
 
-def write_transcript_rows(transcript: dict, meeting_id: str) -> dict:
+def write_transcript_rows(transcript: dict, meeting_id: str, client_reference_id: str = None) -> dict:
     import uuid
 
     transcript_id = str(uuid.uuid4())
@@ -134,6 +139,12 @@ def write_transcript_rows(transcript: dict, meeting_id: str) -> dict:
     meeting_link = transcript.get("meeting_link")
     meeting_date = parse_meeting_date(transcript.get("dateString"))
     sentences = transcript.get("sentences") or []
+
+    # Distinguish an offline file upload from a live Meet call: the offline upload
+    # webpage sets client_reference_id to "offline-<uuid>" when it calls Fireflies'
+    # uploadAudio mutation; a real live meeting never sets this, so anything without
+    # that marker is a live/online meeting - matches the existing default.
+    source = "offline" if (client_reference_id or "").startswith(OFFLINE_UPLOAD_MARKER_PREFIX) else "online"
 
     if not sentences:
         raise RuntimeError(f"Transcript for meeting_id={meeting_id} has no sentences")
@@ -156,7 +167,7 @@ def write_transcript_rows(transcript: dict, meeting_id: str) -> dict:
         for s in sentences:
             cur.execute(insert_sql, (
                 transcript_id,
-                "online",
+                source,
                 meeting_date,
                 meeting_link,
                 meeting_name,
@@ -181,7 +192,7 @@ def write_transcript_rows(transcript: dict, meeting_id: str) -> dict:
     finally:
         conn.close()
 
-    return {"transcript_id": transcript_id, "rows_inserted": inserted, "meeting_name": meeting_name}
+    return {"transcript_id": transcript_id, "rows_inserted": inserted, "meeting_name": meeting_name, "source": source}
 
 
 @app.post("/webhook")
@@ -198,8 +209,12 @@ async def receive_webhook(request: Request):
     # {"event": "meeting.transcribed", "timestamp": ..., "meeting_id": "...", "client_reference_id": "..."}
     event_type = payload.get("event")
     meeting_id = payload.get("meeting_id")
+    client_reference_id = payload.get("client_reference_id")
 
-    logger.info(f"Received webhook: event={event_type!r} meeting_id={meeting_id!r}")
+    logger.info(
+        f"Received webhook: event={event_type!r} meeting_id={meeting_id!r} "
+        f"client_reference_id={client_reference_id!r}"
+    )
 
     if event_type != "meeting.transcribed":
         logger.info(f"Ignoring event {event_type!r} - only handling 'meeting.transcribed'")
@@ -211,9 +226,9 @@ async def receive_webhook(request: Request):
 
     try:
         transcript = fetch_transcript(meeting_id)
-        result = write_transcript_rows(transcript, meeting_id)
+        result = write_transcript_rows(transcript, meeting_id, client_reference_id)
         logger.info(
-            f"Wrote transcript_id={result['transcript_id']} "
+            f"Wrote transcript_id={result['transcript_id']} source={result['source']!r} "
             f"rows={result['rows_inserted']} meeting={result['meeting_name']!r}"
         )
         return {"status": "ok", **result}
