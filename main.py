@@ -2,11 +2,29 @@
 Fireflies webhook receiver + transcript writer.
 
 Flow: Fireflies POSTs to /webhook when a meeting's transcript is ready ->
-verify the request is genuinely from Fireflies (HMAC-SHA256 over the raw
-body, using FIREFLIES_WEBHOOK_SECRET) -> pull the full transcript via their
-GraphQL API -> map it onto the drt.ta_interview_transcript schema -> insert
-ONE row per interview (segments nested as a JSONB array), not one row per
-sentence.
+figure out WHICH Fireflies account it came from (see below) -> pull the full
+transcript via that account's own API key -> map it onto the
+drt.ta_interview_transcript schema -> insert ONE row per interview (segments
+nested as a JSONB array), not one row per sentence.
+
+Multi-account support: this receiver serves multiple HRs' individual
+Fireflies accounts, all pointed at the same webhook URL. Fireflies' webhook
+payload has no account/workspace/user-identifying field at all (checked
+against their docs) - the only per-account thing we can configure is each
+account's own webhook signing secret. So: every account gets a genuinely
+UNIQUE secret when its webhook is set up on Fireflies' side, and on receipt
+we try the incoming signature against every configured account's secret;
+whichever one matches tells us which account's API key to use for the
+GraphQL pull. FIREFLIES_ACCOUNTS (a JSON array in one env var) holds the
+[{label, webhook_secret, api_key}, ...] list - adding a new HR is just
+appending one entry to that array, no code change.
+
+If two accounts were ever configured with the same secret, we could never
+tell them apart (whichever is checked first always "wins"), and the failure
+would be silent - a webhook would still succeed, just possibly attributed to
+the wrong account. To make that impossible instead of just documented, this
+module refuses to start at all if it finds a duplicate secret in
+FIREFLIES_ACCOUNTS (see the check right after ACCOUNTS is loaded below).
 
 Offline vs online classification: meeting_link is the primary signal, NOT
 title. meeting_link is only populated by Fireflies for a call on a supported
@@ -41,6 +59,7 @@ this file was updated alongside.
 """
 
 import os
+import json
 import hmac
 import hashlib
 import logging
@@ -54,11 +73,41 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-FIREFLIES_API_KEY = os.environ["FIREFLIES_API_KEY"]
-FIREFLIES_WEBHOOK_SECRET = os.environ["FIREFLIES_WEBHOOK_SECRET"]
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
-
 INTERVIEWER_EMAIL_DOMAIN = "axestrack.com"
+
+# FIREFLIES_ACCOUNTS: JSON array, one entry per HR's Fireflies account:
+#   [{"label": "aryan", "webhook_secret": "...", "api_key": "..."}, ...]
+# Each account MUST have a genuinely unique webhook_secret - it's the only
+# signal that tells two accounts' webhooks apart (see module docstring).
+try:
+    FIREFLIES_ACCOUNTS = json.loads(os.environ["FIREFLIES_ACCOUNTS"])
+except (KeyError, json.JSONDecodeError) as e:
+    raise RuntimeError(
+        "FIREFLIES_ACCOUNTS env var is missing or not valid JSON - expected "
+        '\'[{"label": "...", "webhook_secret": "...", "api_key": "..."}, ...]\''
+    ) from e
+
+if not isinstance(FIREFLIES_ACCOUNTS, list) or not FIREFLIES_ACCOUNTS:
+    raise RuntimeError("FIREFLIES_ACCOUNTS must be a non-empty JSON array")
+
+for i, acct in enumerate(FIREFLIES_ACCOUNTS):
+    for field in ("label", "webhook_secret", "api_key"):
+        if not acct.get(field):
+            raise RuntimeError(f"FIREFLIES_ACCOUNTS[{i}] is missing required field {field!r}")
+
+_secrets_seen = {}
+for acct in FIREFLIES_ACCOUNTS:
+    prior = _secrets_seen.get(acct["webhook_secret"])
+    if prior:
+        raise RuntimeError(
+            f"Duplicate webhook_secret in FIREFLIES_ACCOUNTS: accounts "
+            f"{prior!r} and {acct['label']!r} share the same secret - each "
+            f"account MUST have a genuinely unique secret, or their webhooks "
+            f"can never be told apart (this refuses to start rather than "
+            f"silently misattributing one account's data to the other)."
+        )
+    _secrets_seen[acct["webhook_secret"]] = acct["label"]
 
 DB_CONFIG = {
     "host": os.environ["DB_HOST"],
@@ -86,19 +135,29 @@ def health_check_head():
     return
 
 
-def verify_signature(raw_body: bytes, signature_header: str) -> bool:
+def identify_account(raw_body: bytes, signature_header: str):
+    """
+    Try the incoming signature against every configured account's secret.
+    Returns the matching account dict ({label, webhook_secret, api_key}), or
+    None if no account's secret produces a matching signature.
+    """
     if not signature_header:
-        return False
-    computed = hmac.new(
-        FIREFLIES_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256
-    ).hexdigest()
+        return None
+
     # Fireflies sends the header as "sha256=<hex>" (v2 docs, confirmed) - strip the
     # prefix before comparing, or every real webhook would fail signature checks.
     received = signature_header
     if received.startswith("sha256="):
         received = received[len("sha256="):]
-    # constant-time compare - avoid leaking timing info about the correct signature
-    return hmac.compare_digest(computed, received)
+
+    for acct in FIREFLIES_ACCOUNTS:
+        computed = hmac.new(
+            acct["webhook_secret"].encode("utf-8"), raw_body, hashlib.sha256
+        ).hexdigest()
+        # constant-time compare - avoid leaking timing info about the correct signature
+        if hmac.compare_digest(computed, received):
+            return acct
+    return None
 
 
 TRANSCRIPT_QUERY = """
@@ -125,12 +184,12 @@ query Transcript($transcriptId: String!) {
 """
 
 
-def fetch_transcript(meeting_id: str) -> dict:
+def fetch_transcript(meeting_id: str, api_key: str) -> dict:
     resp = requests.post(
         FIREFLIES_GRAPHQL_URL,
         json={"query": TRANSCRIPT_QUERY, "variables": {"transcriptId": meeting_id}},
         headers={
-            "Authorization": f"Bearer {FIREFLIES_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
         timeout=30,
@@ -340,8 +399,9 @@ async def receive_webhook(request: Request):
     raw_body = await request.body()
     signature = request.headers.get("x-hub-signature", "")
 
-    if not verify_signature(raw_body, signature):
-        logger.warning("Rejected webhook: signature verification failed")
+    account = identify_account(raw_body, signature)
+    if account is None:
+        logger.warning("Rejected webhook: signature didn't match any configured account")
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     payload = await request.json()
@@ -350,7 +410,9 @@ async def receive_webhook(request: Request):
     event_type = payload.get("event")
     meeting_id = payload.get("meeting_id")
 
-    logger.info(f"Received webhook: event={event_type!r} meeting_id={meeting_id!r}")
+    logger.info(
+        f"Received webhook: account={account['label']!r} event={event_type!r} meeting_id={meeting_id!r}"
+    )
 
     if event_type != "meeting.transcribed":
         logger.info(f"Ignoring event {event_type!r} - only handling 'meeting.transcribed'")
@@ -361,14 +423,15 @@ async def receive_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Missing meeting_id")
 
     try:
-        transcript = fetch_transcript(meeting_id)
+        transcript = fetch_transcript(meeting_id, account["api_key"])
         result = write_transcript_row(transcript, meeting_id)
         logger.info(
-            f"Wrote transcript_id={result['transcript_id']} source={result['source']!r} "
-            f"interviewer={result['interviewer_name']!r} candidate={result['candidate_name']!r} "
-            f"segments={result['segment_count']} meeting={result['meeting_name']!r}"
+            f"Wrote transcript_id={result['transcript_id']} account={account['label']!r} "
+            f"source={result['source']!r} interviewer={result['interviewer_name']!r} "
+            f"candidate={result['candidate_name']!r} segments={result['segment_count']} "
+            f"meeting={result['meeting_name']!r}"
         )
-        return {"status": "ok", **result}
+        return {"status": "ok", "account": account["label"], **result}
     except Exception as e:
         logger.exception(f"Failed to process meeting_id={meeting_id}")
         # Return 500 so Fireflies' webhook delivery sees a failure (may retry per their policy) -
