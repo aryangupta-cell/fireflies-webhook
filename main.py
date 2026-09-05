@@ -4,8 +4,26 @@ Fireflies webhook receiver + transcript writer.
 Flow: Fireflies POSTs to /webhook when a meeting's transcript is ready ->
 verify the request is genuinely from Fireflies (HMAC-SHA256 over the raw
 body, using FIREFLIES_WEBHOOK_SECRET) -> pull the full transcript via their
-GraphQL API -> map it onto the drt.ta_interview_transcript schema (source='online')
--> insert one row per sentence.
+GraphQL API -> map it onto the drt.ta_interview_transcript schema -> insert
+one row per sentence.
+
+Offline vs online, and interviewer/candidate name extraction, both come from
+one signal: the meeting TITLE. HR manually uploads the MP3 through Fireflies'
+own dashboard and names it "Interviewer_Candidate_Date" (e.g.
+"Priya_RahulSharma_04-09-2026"). If the title splits into >=2 "_"-separated
+parts, this is treated as an offline upload (source='offline') and
+interviewer_name/candidate_name/meeting_date are parsed from it. Otherwise
+it's treated as a live Meet call (source='online'), same as before.
+
+This replaces an earlier plan to tag offline uploads via client_reference_id
+on a programmatic uploadAudio API call - that approach (and the URL-hosting
+problem it required solving) was dropped in favor of this simpler manual
+workflow. client_reference_id is no longer set by anything upstream of this
+receiver, for either offline or online, so title-parsing is now the ONLY
+signal distinguishing the two - there is no independent confirmation left.
+A live meeting that happens to get named with two-or-more underscore-
+separated words would be misclassified as an offline upload; this is an
+accepted tradeoff of the simpler approach, not an oversight.
 
 Deployed at /data/shared/Rudhi_P1/pace/transcript/ on the aterp server,
 run via systemd (see fireflies-webhook.service), reverse-proxied by nginx
@@ -35,9 +53,9 @@ FIREFLIES_API_KEY = os.environ["FIREFLIES_API_KEY"]
 FIREFLIES_WEBHOOK_SECRET = os.environ["FIREFLIES_WEBHOOK_SECRET"]
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
 
-# Set as client_reference_id by the offline upload webpage when it calls Fireflies'
-# uploadAudio mutation, so this receiver can tell an offline file upload apart from
-# a real live Meet call (which never sets client_reference_id).
+# Deprecated: was set as client_reference_id by a planned programmatic upload flow
+# that got dropped. No longer set by anything, kept only so the field is documented
+# if it ever comes back.
 OFFLINE_UPLOAD_MARKER_PREFIX = "offline-"
 
 DB_CONFIG = {
@@ -131,20 +149,86 @@ def parse_meeting_date(date_string: str):
         return datetime.now(timezone.utc).date().isoformat()
 
 
+def parse_offline_title(title: str, fallback_date_string: str):
+    """
+    Parse the "Interviewer_Candidate_Date" naming convention HR uses when
+    manually uploading an offline MP3 through Fireflies' dashboard, e.g.
+    "Priya_RahulSharma_04-09-2026".
+
+    Returns (is_offline, interviewer_name, candidate_name, meeting_date, warnings).
+    is_offline is the ONLY signal used for source='offline' vs 'online' now
+    (see module docstring) - a title with >=2 "_"-separated parts is treated
+    as an offline upload; anything else (a real meeting title) is online.
+
+    Never raises - a malformed/missing title just means less gets parsed,
+    logged as a warning, not a crash (same graceful-degradation pattern used
+    elsewhere in this file, e.g. transcript-not-found handling).
+    """
+    warnings = []
+    title = (title or "").strip()
+    parts = title.split("_") if title else []
+
+    if len(parts) < 2:
+        return False, None, None, None, warnings
+
+    interviewer_name = parts[0].strip() or None
+    candidate_name = parts[1].strip() or None
+    meeting_date = None
+
+    if len(parts) >= 3:
+        date_part = parts[2].strip()
+        # Example format from the convention: "04-09-2026" = DD-MM-YYYY
+        for fmt in ("%d-%m-%Y", "%d-%m-%y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                meeting_date = datetime.strptime(date_part, fmt).date().isoformat()
+                break
+            except ValueError:
+                continue
+        if meeting_date is None:
+            warnings.append(
+                f"title date part {date_part!r} did not match any known format - "
+                f"falling back to Fireflies' own dateString"
+            )
+    else:
+        warnings.append(f"title {title!r} has no third part for date - falling back to dateString")
+
+    if meeting_date is None:
+        meeting_date = parse_meeting_date(fallback_date_string)
+
+    return True, interviewer_name, candidate_name, meeting_date, warnings
+
+
 def write_transcript_rows(transcript: dict, meeting_id: str, client_reference_id: str = None) -> dict:
     import uuid
 
     transcript_id = str(uuid.uuid4())
     meeting_name = transcript.get("title")
     meeting_link = transcript.get("meeting_link")
-    meeting_date = parse_meeting_date(transcript.get("dateString"))
     sentences = transcript.get("sentences") or []
 
-    # Distinguish an offline file upload from a live Meet call: the offline upload
-    # webpage sets client_reference_id to "offline-<uuid>" when it calls Fireflies'
-    # uploadAudio mutation; a real live meeting never sets this, so anything without
-    # that marker is a live/online meeting - matches the existing default.
-    source = "offline" if (client_reference_id or "").startswith(OFFLINE_UPLOAD_MARKER_PREFIX) else "online"
+    # Title-parsing is the ONLY signal for offline vs online now (see module
+    # docstring) - client_reference_id is deprecated and unused.
+    is_offline, title_interviewer, title_candidate, title_meeting_date, title_warnings = (
+        parse_offline_title(meeting_name, transcript.get("dateString"))
+    )
+    for w in title_warnings:
+        logger.warning(f"meeting_id={meeting_id} title={meeting_name!r}: {w}")
+
+    if is_offline:
+        source = "offline"
+        interviewer_name = title_interviewer
+        candidate_name = title_candidate
+        meeting_date = title_meeting_date
+        if interviewer_name is None or candidate_name is None:
+            logger.warning(
+                f"meeting_id={meeting_id} title={meeting_name!r}: interviewer/candidate "
+                f"came back empty after parsing - storing as NULL, needs manual follow-up"
+            )
+    else:
+        source = "online"
+        interviewer_name = None
+        candidate_name = None
+        meeting_date = parse_meeting_date(transcript.get("dateString"))
 
     if not sentences:
         raise RuntimeError(f"Transcript for meeting_id={meeting_id} has no sentences")
@@ -171,8 +255,8 @@ def write_transcript_rows(transcript: dict, meeting_id: str, client_reference_id
                 meeting_date,
                 meeting_link,
                 meeting_name,
-                None,  # interviewer_name - Fireflies doesn't distinguish interviewer/candidate roles;
-                None,  # candidate_name    speaker_name is stored in `speaker` instead, same as offline's SPEAKER_00/01 labels
+                interviewer_name,  # parsed from title for offline uploads, NULL for online (see above)
+                candidate_name,
                 s.get("start_time"),
                 s.get("end_time"),
                 s.get("speaker_name") or s.get("speaker_id") or "UNKNOWN",
