@@ -5,35 +5,39 @@ Flow: Fireflies POSTs to /webhook when a meeting's transcript is ready ->
 verify the request is genuinely from Fireflies (HMAC-SHA256 over the raw
 body, using FIREFLIES_WEBHOOK_SECRET) -> pull the full transcript via their
 GraphQL API -> map it onto the drt.ta_interview_transcript schema -> insert
-one row per sentence.
+ONE row per interview (segments nested as a JSONB array), not one row per
+sentence.
 
-Offline vs online, and interviewer/candidate name extraction, both come from
-one signal: the meeting TITLE. HR manually uploads the MP3 through Fireflies'
-own dashboard and names it "Interviewer_Candidate_Date" (e.g.
-"Priya_RahulSharma_04-09-2026"). If the title splits into >=2 "_"-separated
-parts, this is treated as an offline upload (source='offline') and
-interviewer_name/candidate_name/meeting_date are parsed from it. Otherwise
-it's treated as a live Meet call (source='online'), same as before.
+Offline vs online classification: meeting_link is the primary signal, NOT
+title. meeting_link is only populated by Fireflies for a call on a supported
+live platform (Meet, Zoom, etc) - it's null for an uploaded audio file. So:
+  - meeting_link present  -> source='online', real live meeting.
+  - meeting_link absent   -> source='offline', an uploaded MP3.
+(Title-parsing was tried as the sole signal first, but a real Meet call
+titled "Test_3" got wrongly classified offline purely because the title
+happened to match the naming convention - meeting_link doesn't have that
+false-positive risk, since a real meeting always gets it populated.)
 
-This replaces an earlier plan to tag offline uploads via client_reference_id
-on a programmatic uploadAudio API call - that approach (and the URL-hosting
-problem it required solving) was dropped in favor of this simpler manual
-workflow. client_reference_id is no longer set by anything upstream of this
-receiver, for either offline or online, so title-parsing is now the ONLY
-signal distinguishing the two - there is no independent confirmation left.
-A live meeting that happens to get named with two-or-more underscore-
-separated words would be misclassified as an offline upload; this is an
-accepted tradeoff of the simpler approach, not an oversight.
+Interviewer/candidate extraction now differs by source:
+  - online: from `meeting_attendees` (displayName + email per participant).
+    Anyone with an @axestrack.com email -> interviewer_name (first match).
+    Anyone with a different domain -> candidate_name (first match). Multiple
+    external participants: we pick the first and log a warning noting the
+    ambiguity rather than guessing further - a real edge case (e.g. two
+    candidates, or an external observer on the call) that needs a human to
+    resolve, not a heuristic.
+  - offline: still from the "Interviewer_Candidate_Date" title convention
+    HR uses when manually uploading through Fireflies' dashboard, e.g.
+    "Priya_RahulSharma_04-09-2026" (unchanged from before).
 
 Deployed at /data/shared/Rudhi_P1/pace/transcript/ on the aterp server,
 run via systemd (see fireflies-webhook.service), reverse-proxied by nginx
 at https://aterp.xswift.biz/fireflies-webhook/ .
 
-avg_logprob is always NULL and needs_review always FALSE for these rows:
-Fireflies' Sentence GraphQL type (checked against their published schema)
-exposes no confidence/score/probability field at all, so there is nothing
-to map it from - this isn't a placeholder, it's the accurate reflection of
-what data exists.
+No confidence/quality signal exists for either source (Fireflies exposes
+none per-sentence), so those columns were dropped entirely from the schema
+rather than kept as always-NULL placeholders - see the schema migration
+this file was updated alongside.
 """
 
 import os
@@ -44,6 +48,7 @@ from datetime import datetime, timezone
 
 import requests
 import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
 
@@ -53,10 +58,7 @@ FIREFLIES_API_KEY = os.environ["FIREFLIES_API_KEY"]
 FIREFLIES_WEBHOOK_SECRET = os.environ["FIREFLIES_WEBHOOK_SECRET"]
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
 
-# Deprecated: was set as client_reference_id by a planned programmatic upload flow
-# that got dropped. No longer set by anything, kept only so the field is documented
-# if it ever comes back.
-OFFLINE_UPLOAD_MARKER_PREFIX = "offline-"
+INTERVIEWER_EMAIL_DOMAIN = "axestrack.com"
 
 DB_CONFIG = {
     "host": os.environ["DB_HOST"],
@@ -69,7 +71,7 @@ DB_CONFIG = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("fireflies_webhook")
 
-app = FastAPI(title="Fireflies Webhook Receiver", version="1.0.0")
+app = FastAPI(title="Fireflies Webhook Receiver", version="2.0.0")
 
 
 @app.get("/")
@@ -105,6 +107,10 @@ query Transcript($transcriptId: String!) {
     title
     meeting_link
     dateString
+    meeting_attendees {
+      displayName
+      email
+    }
     sentences {
       index
       text
@@ -153,23 +159,21 @@ def parse_offline_title(title: str, fallback_date_string: str):
     """
     Parse the "Interviewer_Candidate_Date" naming convention HR uses when
     manually uploading an offline MP3 through Fireflies' dashboard, e.g.
-    "Priya_RahulSharma_04-09-2026".
+    "Priya_RahulSharma_04-09-2026". Only called for offline uploads (source
+    already determined by meeting_link being absent) - this no longer
+    decides source itself, just extracts names/date from the title.
 
-    Returns (is_offline, interviewer_name, candidate_name, meeting_date, warnings).
-    is_offline is the ONLY signal used for source='offline' vs 'online' now
-    (see module docstring) - a title with >=2 "_"-separated parts is treated
-    as an offline upload; anything else (a real meeting title) is online.
-
+    Returns (interviewer_name, candidate_name, meeting_date, warnings).
     Never raises - a malformed/missing title just means less gets parsed,
-    logged as a warning, not a crash (same graceful-degradation pattern used
-    elsewhere in this file, e.g. transcript-not-found handling).
+    logged as a warning, not a crash.
     """
     warnings = []
     title = (title or "").strip()
     parts = title.split("_") if title else []
 
     if len(parts) < 2:
-        return False, None, None, None, warnings
+        warnings.append(f"title {title!r} has fewer than 2 '_'-separated parts - interviewer/candidate left NULL")
+        return None, None, parse_meeting_date(fallback_date_string), warnings
 
     interviewer_name = parts[0].strip() or None
     candidate_name = parts[1].strip() or None
@@ -195,10 +199,55 @@ def parse_offline_title(title: str, fallback_date_string: str):
     if meeting_date is None:
         meeting_date = parse_meeting_date(fallback_date_string)
 
-    return True, interviewer_name, candidate_name, meeting_date, warnings
+    return interviewer_name, candidate_name, meeting_date, warnings
 
 
-def write_transcript_rows(transcript: dict, meeting_id: str, client_reference_id: str = None) -> dict:
+def classify_online_participants(meeting_attendees: list):
+    """
+    For a live online meeting: classify attendees by email domain.
+    @axestrack.com -> interviewer_name (first match), anything else ->
+    candidate_name (first match). Multiple external participants is a real
+    ambiguity (could be two candidates, or an external observer) - we pick
+    the first and log a warning rather than guessing which one is "the"
+    candidate.
+
+    Returns (interviewer_name, candidate_name, warnings).
+    """
+    warnings = []
+    interviewer_name = None
+    candidate_name = None
+    external_matches = []
+
+    for attendee in meeting_attendees or []:
+        email = (attendee.get("email") or "").strip()
+        display_name = (attendee.get("displayName") or "").strip() or email or None
+        if not email:
+            continue
+        domain = email.split("@")[-1].lower() if "@" in email else ""
+        if domain == INTERVIEWER_EMAIL_DOMAIN:
+            if interviewer_name is None:
+                interviewer_name = display_name
+        else:
+            external_matches.append(display_name)
+
+    if external_matches:
+        candidate_name = external_matches[0]
+        if len(external_matches) > 1:
+            warnings.append(
+                f"multiple non-{INTERVIEWER_EMAIL_DOMAIN} participants found "
+                f"({external_matches}) - picked the first as candidate_name, "
+                f"needs manual confirmation"
+            )
+
+    if interviewer_name is None:
+        warnings.append(f"no @{INTERVIEWER_EMAIL_DOMAIN} participant found - interviewer_name left NULL")
+    if candidate_name is None:
+        warnings.append("no non-interviewer-domain participant found - candidate_name left NULL")
+
+    return interviewer_name, candidate_name, warnings
+
+
+def write_transcript_row(transcript: dict, meeting_id: str) -> dict:
     import uuid
 
     transcript_id = str(uuid.uuid4())
@@ -206,68 +255,59 @@ def write_transcript_rows(transcript: dict, meeting_id: str, client_reference_id
     meeting_link = transcript.get("meeting_link")
     sentences = transcript.get("sentences") or []
 
-    # Title-parsing is the ONLY signal for offline vs online now (see module
-    # docstring) - client_reference_id is deprecated and unused.
-    is_offline, title_interviewer, title_candidate, title_meeting_date, title_warnings = (
-        parse_offline_title(meeting_name, transcript.get("dateString"))
-    )
-    for w in title_warnings:
-        logger.warning(f"meeting_id={meeting_id} title={meeting_name!r}: {w}")
-
-    if is_offline:
-        source = "offline"
-        interviewer_name = title_interviewer
-        candidate_name = title_candidate
-        meeting_date = title_meeting_date
-        if interviewer_name is None or candidate_name is None:
-            logger.warning(
-                f"meeting_id={meeting_id} title={meeting_name!r}: interviewer/candidate "
-                f"came back empty after parsing - storing as NULL, needs manual follow-up"
-            )
-    else:
+    # meeting_link is the ONLY signal for offline vs online now (see module
+    # docstring) - a real live meeting always has it populated; an uploaded
+    # audio file never does.
+    if meeting_link:
         source = "online"
-        interviewer_name = None
-        candidate_name = None
+        interviewer_name, candidate_name, warnings = classify_online_participants(
+            transcript.get("meeting_attendees") or []
+        )
         meeting_date = parse_meeting_date(transcript.get("dateString"))
+    else:
+        source = "offline"
+        interviewer_name, candidate_name, meeting_date, warnings = parse_offline_title(
+            meeting_name, transcript.get("dateString")
+        )
+
+    for w in warnings:
+        logger.warning(f"meeting_id={meeting_id} source={source} title={meeting_name!r}: {w}")
 
     if not sentences:
         raise RuntimeError(f"Transcript for meeting_id={meeting_id} has no sentences")
 
+    segments = [
+        {
+            "segment_start": s.get("start_time"),
+            "segment_end": s.get("end_time"),
+            "speaker": s.get("speaker_name") or s.get("speaker_id") or "UNKNOWN",
+            "text": (s.get("text") or "").strip(),
+        }
+        for s in sentences
+    ]
+
     insert_sql = """
         INSERT INTO drt.ta_interview_transcript (
             transcript_id, source, meeting_date, meeting_link, meeting_name,
-            interviewer_name, candidate_name, segment_start, segment_end,
-            speaker, text, avg_logprob, needs_review, flag_reason,
-            diarization_confidence, speaker_review_needed
+            interviewer_name, candidate_name, segments
         ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s
         );
     """
 
     conn = psycopg2.connect(**DB_CONFIG, connect_timeout=10)
-    inserted = 0
     try:
         cur = conn.cursor()
-        for s in sentences:
-            cur.execute(insert_sql, (
-                transcript_id,
-                source,
-                meeting_date,
-                meeting_link,
-                meeting_name,
-                interviewer_name,  # parsed from title for offline uploads, NULL for online (see above)
-                candidate_name,
-                s.get("start_time"),
-                s.get("end_time"),
-                s.get("speaker_name") or s.get("speaker_id") or "UNKNOWN",
-                (s.get("text") or "").strip(),
-                None,   # avg_logprob - not available from Fireflies, see module docstring
-                False,  # needs_review - no confidence signal to flag on; defaults to not-flagged
-                None,   # flag_reason
-                None,   # diarization_confidence - parked, out of scope (same as offline pipeline)
-                False,  # speaker_review_needed - parked, out of scope
-            ))
-            inserted += 1
+        cur.execute(insert_sql, (
+            transcript_id,
+            source,
+            meeting_date,
+            meeting_link,
+            meeting_name,
+            interviewer_name,
+            candidate_name,
+            psycopg2.extras.Json(segments),
+        ))
         conn.commit()
         cur.close()
     except Exception:
@@ -276,7 +316,14 @@ def write_transcript_rows(transcript: dict, meeting_id: str, client_reference_id
     finally:
         conn.close()
 
-    return {"transcript_id": transcript_id, "rows_inserted": inserted, "meeting_name": meeting_name, "source": source}
+    return {
+        "transcript_id": transcript_id,
+        "source": source,
+        "meeting_name": meeting_name,
+        "interviewer_name": interviewer_name,
+        "candidate_name": candidate_name,
+        "segment_count": len(segments),
+    }
 
 
 @app.post("/webhook")
@@ -293,12 +340,8 @@ async def receive_webhook(request: Request):
     # {"event": "meeting.transcribed", "timestamp": ..., "meeting_id": "...", "client_reference_id": "..."}
     event_type = payload.get("event")
     meeting_id = payload.get("meeting_id")
-    client_reference_id = payload.get("client_reference_id")
 
-    logger.info(
-        f"Received webhook: event={event_type!r} meeting_id={meeting_id!r} "
-        f"client_reference_id={client_reference_id!r}"
-    )
+    logger.info(f"Received webhook: event={event_type!r} meeting_id={meeting_id!r}")
 
     if event_type != "meeting.transcribed":
         logger.info(f"Ignoring event {event_type!r} - only handling 'meeting.transcribed'")
@@ -310,10 +353,11 @@ async def receive_webhook(request: Request):
 
     try:
         transcript = fetch_transcript(meeting_id)
-        result = write_transcript_rows(transcript, meeting_id, client_reference_id)
+        result = write_transcript_row(transcript, meeting_id)
         logger.info(
             f"Wrote transcript_id={result['transcript_id']} source={result['source']!r} "
-            f"rows={result['rows_inserted']} meeting={result['meeting_name']!r}"
+            f"interviewer={result['interviewer_name']!r} candidate={result['candidate_name']!r} "
+            f"segments={result['segment_count']} meeting={result['meeting_name']!r}"
         )
         return {"status": "ok", **result}
     except Exception as e:
