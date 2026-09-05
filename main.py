@@ -216,6 +216,7 @@ def classify_online_participants(meeting_attendees: list):
     warnings = []
     interviewer_name = None
     candidate_name = None
+    internal_matches = []
     external_matches = []
 
     for attendee in meeting_attendees or []:
@@ -225,10 +226,18 @@ def classify_online_participants(meeting_attendees: list):
             continue
         domain = email.split("@")[-1].lower() if "@" in email else ""
         if domain == INTERVIEWER_EMAIL_DOMAIN:
-            if interviewer_name is None:
-                interviewer_name = display_name
+            internal_matches.append(display_name)
         else:
             external_matches.append(display_name)
+
+    if internal_matches:
+        interviewer_name = internal_matches[0]
+        if len(internal_matches) > 1:
+            warnings.append(
+                f"multiple internal (@{INTERVIEWER_EMAIL_DOMAIN}) participants found, "
+                f"using first: {internal_matches[0]!r}, ignoring: {internal_matches[1:]} - "
+                f"if one of the ignored ones was the real interviewer, needs manual fix"
+            )
 
     if external_matches:
         candidate_name = external_matches[0]
