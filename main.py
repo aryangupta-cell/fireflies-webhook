@@ -38,15 +38,39 @@ false-positive risk, since a real meeting always gets it populated.)
 
 Interviewer/candidate extraction now differs by source:
   - online: from `meeting_attendees` (displayName + email per participant).
-    Anyone with an @axestrack.com email -> interviewer_name (first match).
-    Anyone with a different domain -> candidate_name (first match). Multiple
-    external participants: we pick the first and log a warning noting the
-    ambiguity rather than guessing further - a real edge case (e.g. two
-    candidates, or an external observer on the call) that needs a human to
-    resolve, not a heuristic.
-  - offline: still from the "Interviewer_Candidate_Date" title convention
-    HR uses when manually uploading through Fireflies' dashboard, e.g.
-    "Priya_RahulSharma_04-09-2026" (unchanged from before).
+    Anyone whose email domain CONTAINS "axestrack" (not exact-match - covers
+    @axestrack.com, @ct.axestrack.com, @it.axestrack.com, etc) is a candidate
+    interviewer, UNLESS their email is in the HR-exclusion Google Sheet (HR
+    often opens/closes the call but isn't "the interviewer" for this row).
+    After HR exclusion: 0 remaining internal participants -> interviewer_name
+    NULL; exactly 1 -> that person's displayName; 2+ -> comma-separated
+    displayNames (e.g. "Priya, Rahul") - genuinely ambiguous which one is
+    "the" interviewer when more than one remains, so all of them are kept
+    rather than arbitrarily picking one. Anyone with a non-axestrack domain
+    -> candidate_name (first match; multiple such participants still log a
+    warning and pick the first, same as before).
+  - offline: still from the "Interviewer_Candidate_Date[_Time]" title
+    convention HR uses when manually uploading through Fireflies' dashboard,
+    e.g. "Priya_RahulSharma_04-09-2026" or, if a start time is included,
+    "Priya_RahulSharma_04-09-2026_14-32" (HH-MM, 24h, dash not colon since
+    colons aren't valid in Windows filenames).
+
+HR exclusion list: fetched live from a Google Sheet (gspread, same service-
+account pattern as emp_details_hrt.py elsewhere in this org's codebase) on
+every request - not cached/baked in, so editing the sheet takes effect
+immediately with no redeploy. GOOGLE_SHEET_ID (env var) points at it;
+GOOGLE_SERVICE_ACCOUNT_JSON (env var, the full key file contents as a JSON
+string) authenticates, since Render has no access to a local key file.
+
+Segment timestamps: converted from elapsed-seconds-into-the-recording to
+real wall-clock time ("HH:MM:SS", Asia/Kolkata) wherever a reliable meeting
+start time exists - online: Fireflies' own dateString (see caveat below);
+offline: parsed from the title's optional 4th "_"-separated part. If no
+valid start time can be determined for either source, segment_start/
+segment_end are left NULL rather than guessing - same principle as the date
+fields. NOTE: Fireflies' docs do not explicitly document dateString as the
+meeting's actual start time (vs. "when the transcript record was created") -
+this is a reasonable but unverified assumption for online meetings.
 
 Deployed at /data/shared/Rudhi_P1/pace/transcript/ on the aterp server,
 run via systemd (see fireflies-webhook.service), reverse-proxied by nginx
@@ -64,8 +88,10 @@ import re
 import hmac
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+import pytz
+import gspread
 import requests
 import psycopg2
 import psycopg2.extras
@@ -74,8 +100,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+IST = pytz.timezone("Asia/Kolkata")
+
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
-INTERVIEWER_EMAIL_DOMAIN = "axestrack.com"
+INTERVIEWER_EMAIL_DOMAIN_SUBSTRING = "axestrack"
+
+GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "Sheet2")
+GOOGLE_SERVICE_ACCOUNT_JSON = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 
 # FIREFLIES_ACCOUNTS: JSON array, one entry per HR's Fireflies account:
 #   [{"label": "aryan", "webhook_secret": "...", "api_key": "..."}, ...]
@@ -215,22 +247,54 @@ def parse_meeting_date(date_string: str):
         return datetime.now(timezone.utc).date().isoformat()
 
 
+def parse_online_start_datetime(date_string: str):
+    """
+    Full tz-aware IST datetime from Fireflies' dateString, used as the
+    online meeting start time for converting segment elapsed-seconds to
+    wall-clock time. Returns None if dateString is missing/unparseable -
+    no guessing (see module docstring caveat re: whether dateString is
+    truly the meeting start vs. transcript-creation time).
+    """
+    if not date_string:
+        return None
+    try:
+        utc_dt = datetime.fromisoformat(date_string.replace("Z", "+00:00"))
+        return utc_dt.astimezone(IST)
+    except ValueError:
+        return None
+
+
+def strip_media_extension(part: str) -> str:
+    # Fireflies sometimes uses the raw uploaded filename as the title, so a
+    # trailing "_"-part can arrive with a media extension attached (e.g.
+    # "06-09-2021.mp3" or "14-32.mp3" for date/time parts respectively).
+    # Strip it before attempting to parse - a code fix rather than relying on
+    # HR to remember to omit the extension when naming the upload.
+    return re.sub(
+        r"\.(mp3|m4a|wav|wave|ogg|flac|aac|webm|mp4|mov|avi|mkv)$", "", part, flags=re.IGNORECASE
+    )
+
+
 def parse_offline_title(title: str):
     """
-    Parse the "Interviewer_Candidate_Date" naming convention HR uses when
-    manually uploading an offline MP3 through Fireflies' dashboard, e.g.
-    "Priya_RahulSharma_04-09-2026". Only called for offline uploads (source
-    already determined by meeting_link being absent) - this no longer
-    decides source itself, just extracts names/date from the title.
+    Parse the "Interviewer_Candidate_Date[_Time]" naming convention HR uses
+    when manually uploading an offline MP3 through Fireflies' dashboard,
+    e.g. "Priya_RahulSharma_04-09-2026" or, with a start time,
+    "Priya_RahulSharma_04-09-2026_14-32" (HH-MM, 24h, dash not colon - colons
+    aren't valid in Windows filenames). Only called for offline uploads
+    (source already determined by meeting_link being absent) - this no
+    longer decides source itself, just extracts names/date/time from the title.
 
-    Returns (interviewer_name, candidate_name, meeting_date, warnings).
+    Returns (interviewer_name, candidate_name, meeting_date, start_datetime, warnings).
     meeting_date is the actual INTERVIEW date (distinct from
     meeting_upload_date, which always comes from Fireflies' own dateString
-    regardless of source). If the title's date part is missing or doesn't
-    parse, meeting_date is None - deliberately NOT backfilled from
-    dateString anymore, since dateString is upload/processing time, not
-    necessarily when the interview actually happened; a wrong-but-plausible
-    guess is worse than an honest NULL here.
+    regardless of source). start_datetime is a tz-aware IST datetime built
+    from date+time (for converting segment elapsed-seconds to wall-clock
+    time), or None if the date and/or time couldn't be determined.
+
+    Neither value is ever backfilled from dateString - dateString is
+    upload/processing time, not necessarily when the interview actually
+    happened; a wrong-but-plausible guess is worse than an honest NULL here.
 
     Never raises - a malformed/missing title just means less gets parsed,
     logged as a warning, not a crash.
@@ -241,47 +305,91 @@ def parse_offline_title(title: str):
 
     if len(parts) < 2:
         warnings.append(f"title {title!r} has fewer than 2 '_'-separated parts - interviewer/candidate left NULL")
-        return None, None, None, warnings
+        return None, None, None, None, warnings
 
     interviewer_name = parts[0].strip() or None
     candidate_name = parts[1].strip() or None
     meeting_date = None
+    parsed_date = None  # datetime.date, kept alongside the isoformat string for start_datetime construction
+    parsed_time = None  # datetime.time
 
     if len(parts) >= 3:
-        date_part = parts[2].strip()
-        # Fireflies sometimes uses the raw uploaded filename as the title, so the
-        # date part can arrive with a trailing extension (e.g. "06-09-2021.mp3").
-        # Strip a known media extension before attempting to parse - this is a
-        # code fix rather than relying on HR to remember to omit it.
-        stripped_date_part = re.sub(
-            r"\.(mp3|m4a|wav|wave|ogg|flac|aac|webm|mp4|mov|avi|mkv)$", "", date_part, flags=re.IGNORECASE
-        )
+        date_part = strip_media_extension(parts[2].strip())
         # Example format from the convention: "04-09-2026" = DD-MM-YYYY
         for fmt in ("%d-%m-%Y", "%d-%m-%y", "%d/%m/%Y", "%Y-%m-%d"):
             try:
-                meeting_date = datetime.strptime(stripped_date_part, fmt).date().isoformat()
+                parsed_date = datetime.strptime(date_part, fmt).date()
+                meeting_date = parsed_date.isoformat()
                 break
             except ValueError:
                 continue
         if meeting_date is None:
             warnings.append(
-                f"title date part {date_part!r} (stripped: {stripped_date_part!r}) did not match "
+                f"title date part {parts[2]!r} (stripped: {date_part!r}) did not match "
                 f"any known format - meeting_date left NULL (not guessed from dateString)"
             )
     else:
         warnings.append(f"title {title!r} has no third part for date - meeting_date left NULL")
 
-    return interviewer_name, candidate_name, meeting_date, warnings
+    if len(parts) >= 4:
+        time_part = strip_media_extension(parts[3].strip())
+        try:
+            parsed_time = datetime.strptime(time_part, "%H-%M").time()
+        except ValueError:
+            warnings.append(
+                f"title time part {parts[3]!r} (stripped: {time_part!r}) did not match "
+                f"HH-MM format - segment clock times left NULL"
+            )
+    elif len(parts) < 4:
+        warnings.append(f"title {title!r} has no 4th part for start time - segment clock times left NULL")
+
+    start_datetime = None
+    if parsed_date is not None and parsed_time is not None:
+        start_datetime = IST.localize(datetime.combine(parsed_date, parsed_time))
+
+    return interviewer_name, candidate_name, meeting_date, start_datetime, warnings
 
 
-def classify_online_participants(meeting_attendees: list):
+def fetch_hr_exclusion_emails() -> set:
+    """
+    Fetch the live HR-exclusion list from Google Sheets: single column
+    "Email IDs" (column A, header row 1, emails from row 2), tab
+    GOOGLE_SHEET_TAB in spreadsheet GOOGLE_SHEET_ID. Fetched fresh on every
+    call (not cached) so edits to the sheet take effect immediately with no
+    redeploy - this is a small, infrequent lookup, not a hot path.
+
+    Returns a set of lowercased emails. On any failure (sheet unreachable,
+    renamed tab, etc) logs a warning and returns an empty set - HR exclusion
+    is a refinement, not something that should take the whole webhook down
+    if the sheet is temporarily unavailable.
+    """
+    try:
+        gc = gspread.service_account_from_dict(GOOGLE_SERVICE_ACCOUNT_JSON)
+        ws = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_TAB)
+        values = ws.col_values(1)[1:]  # skip header row
+        return {v.strip().lower() for v in values if v.strip()}
+    except Exception as e:
+        logger.warning(f"Could not fetch HR exclusion list from Google Sheet: {e}")
+        return set()
+
+
+def classify_online_participants(meeting_attendees: list, hr_exclusion_emails: set):
     """
     For a live online meeting: classify attendees by email domain.
-    @axestrack.com -> interviewer_name (first match), anything else ->
-    candidate_name (first match). Multiple external participants is a real
-    ambiguity (could be two candidates, or an external observer) - we pick
-    the first and log a warning rather than guessing which one is "the"
-    candidate.
+    Any email whose domain CONTAINS "axestrack" (substring, not exact match -
+    covers @axestrack.com, @ct.axestrack.com, @it.axestrack.com, etc) is a
+    candidate interviewer, UNLESS their email is in hr_exclusion_emails (HR
+    often opens/closes the call but isn't "the interviewer" for this row).
+
+    After HR exclusion: 0 remaining -> interviewer_name NULL; 1 -> that
+    person's displayName; 2+ -> comma-separated displayNames - genuinely
+    ambiguous which one is "the" interviewer when more than one remains, so
+    all of them are kept rather than arbitrarily picking one.
+
+    Anyone with a non-axestrack domain -> candidate_name (first match).
+    Multiple such participants is a real ambiguity (could be two candidates,
+    or an external observer) - we pick the first and log a warning rather
+    than guessing which one is "the" candidate.
 
     Returns (interviewer_name, candidate_name, warnings).
     """
@@ -289,6 +397,7 @@ def classify_online_participants(meeting_attendees: list):
     interviewer_name = None
     candidate_name = None
     internal_matches = []
+    excluded_matches = []
     external_matches = []
 
     for attendee in meeting_attendees or []:
@@ -297,35 +406,57 @@ def classify_online_participants(meeting_attendees: list):
         if not email:
             continue
         domain = email.split("@")[-1].lower() if "@" in email else ""
-        if domain == INTERVIEWER_EMAIL_DOMAIN:
-            internal_matches.append(display_name)
+        if INTERVIEWER_EMAIL_DOMAIN_SUBSTRING in domain:
+            if email.lower() in hr_exclusion_emails:
+                excluded_matches.append(display_name)
+            else:
+                internal_matches.append(display_name)
         else:
             external_matches.append(display_name)
 
+    if excluded_matches:
+        warnings.append(f"excluded HR participant(s) from interviewer classification: {excluded_matches}")
+
     if internal_matches:
-        interviewer_name = internal_matches[0]
+        interviewer_name = ", ".join(internal_matches)
         if len(internal_matches) > 1:
             warnings.append(
-                f"multiple internal (@{INTERVIEWER_EMAIL_DOMAIN}) participants found, "
-                f"using first: {internal_matches[0]!r}, ignoring: {internal_matches[1:]} - "
-                f"if one of the ignored ones was the real interviewer, needs manual fix"
+                f"multiple non-excluded internal (*{INTERVIEWER_EMAIL_DOMAIN_SUBSTRING}*) participants "
+                f"remained after HR exclusion: {internal_matches} - stored comma-separated in "
+                f"interviewer_name rather than arbitrarily picking one"
             )
 
     if external_matches:
         candidate_name = external_matches[0]
         if len(external_matches) > 1:
             warnings.append(
-                f"multiple non-{INTERVIEWER_EMAIL_DOMAIN} participants found "
+                f"multiple non-{INTERVIEWER_EMAIL_DOMAIN_SUBSTRING} participants found "
                 f"({external_matches}) - picked the first as candidate_name, "
                 f"needs manual confirmation"
             )
 
     if interviewer_name is None:
-        warnings.append(f"no @{INTERVIEWER_EMAIL_DOMAIN} participant found - interviewer_name left NULL")
+        warnings.append(
+            f"no non-excluded *{INTERVIEWER_EMAIL_DOMAIN_SUBSTRING}* participant found - "
+            f"interviewer_name left NULL"
+        )
     if candidate_name is None:
         warnings.append("no non-interviewer-domain participant found - candidate_name left NULL")
 
     return interviewer_name, candidate_name, warnings
+
+
+def compute_clock_time(elapsed_seconds, start_datetime):
+    """
+    Convert an elapsed-seconds-into-the-recording offset to a wall-clock
+    "HH:MM:SS" string (Asia/Kolkata), given the meeting/recording's actual
+    start_datetime (tz-aware). Returns None if either input is missing -
+    no guessing when the start time (or the offset itself) isn't known.
+    """
+    if start_datetime is None or elapsed_seconds is None:
+        return None
+    clock_dt = start_datetime + timedelta(seconds=elapsed_seconds)
+    return clock_dt.strftime("%H:%M:%S")
 
 
 def write_transcript_row(transcript: dict, meeting_id: str) -> dict:
@@ -345,14 +476,18 @@ def write_transcript_row(transcript: dict, meeting_id: str) -> dict:
     # audio file never does.
     if meeting_link:
         source = "online"
+        hr_exclusion_emails = fetch_hr_exclusion_emails()
         interviewer_name, candidate_name, warnings = classify_online_participants(
-            transcript.get("meeting_attendees") or []
+            transcript.get("meeting_attendees") or [], hr_exclusion_emails
         )
         # Online: the live call's date IS the interview date - same value.
         meeting_date = meeting_upload_date
+        start_datetime = parse_online_start_datetime(transcript.get("dateString"))
+        if start_datetime is None:
+            warnings.append("no usable dateString for start time - segment clock times left NULL")
     else:
         source = "offline"
-        interviewer_name, candidate_name, meeting_date, warnings = parse_offline_title(meeting_name)
+        interviewer_name, candidate_name, meeting_date, start_datetime, warnings = parse_offline_title(meeting_name)
         # Offline: meeting_date comes ONLY from the title (interview date). If the
         # title's date part is missing/unparseable, meeting_date stays None here -
         # deliberately not backfilled from meeting_upload_date (see parse_offline_title).
@@ -365,8 +500,8 @@ def write_transcript_row(transcript: dict, meeting_id: str) -> dict:
 
     segments = [
         {
-            "segment_start": s.get("start_time"),
-            "segment_end": s.get("end_time"),
+            "segment_start": compute_clock_time(s.get("start_time"), start_datetime),
+            "segment_end": compute_clock_time(s.get("end_time"), start_datetime),
             "speaker": s.get("speaker_name") or s.get("speaker_id") or "UNKNOWN",
             "text": (s.get("text") or "").strip(),
         }

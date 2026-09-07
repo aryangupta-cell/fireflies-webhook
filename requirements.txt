@@ -3,3 +3,5 @@ uvicorn==0.52.4
 psycopg2-binary==2.9.12
 python-dotenv==1.2.3
 requests==2.34.2
+gspread==6.2.1
+pytz==2026.3.post1
