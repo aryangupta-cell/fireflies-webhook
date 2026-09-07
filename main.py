@@ -60,6 +60,7 @@ this file was updated alongside.
 
 import os
 import json
+import re
 import hmac
 import hashlib
 import logging
@@ -248,17 +249,24 @@ def parse_offline_title(title: str):
 
     if len(parts) >= 3:
         date_part = parts[2].strip()
+        # Fireflies sometimes uses the raw uploaded filename as the title, so the
+        # date part can arrive with a trailing extension (e.g. "06-09-2021.mp3").
+        # Strip a known media extension before attempting to parse - this is a
+        # code fix rather than relying on HR to remember to omit it.
+        stripped_date_part = re.sub(
+            r"\.(mp3|m4a|wav|wave|ogg|flac|aac|webm|mp4|mov|avi|mkv)$", "", date_part, flags=re.IGNORECASE
+        )
         # Example format from the convention: "04-09-2026" = DD-MM-YYYY
         for fmt in ("%d-%m-%Y", "%d-%m-%y", "%d/%m/%Y", "%Y-%m-%d"):
             try:
-                meeting_date = datetime.strptime(date_part, fmt).date().isoformat()
+                meeting_date = datetime.strptime(stripped_date_part, fmt).date().isoformat()
                 break
             except ValueError:
                 continue
         if meeting_date is None:
             warnings.append(
-                f"title date part {date_part!r} did not match any known format - "
-                f"meeting_date left NULL (not guessed from dateString)"
+                f"title date part {date_part!r} (stripped: {stripped_date_part!r}) did not match "
+                f"any known format - meeting_date left NULL (not guessed from dateString)"
             )
     else:
         warnings.append(f"title {title!r} has no third part for date - meeting_date left NULL")
