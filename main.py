@@ -214,7 +214,7 @@ def parse_meeting_date(date_string: str):
         return datetime.now(timezone.utc).date().isoformat()
 
 
-def parse_offline_title(title: str, fallback_date_string: str):
+def parse_offline_title(title: str):
     """
     Parse the "Interviewer_Candidate_Date" naming convention HR uses when
     manually uploading an offline MP3 through Fireflies' dashboard, e.g.
@@ -223,6 +223,14 @@ def parse_offline_title(title: str, fallback_date_string: str):
     decides source itself, just extracts names/date from the title.
 
     Returns (interviewer_name, candidate_name, meeting_date, warnings).
+    meeting_date is the actual INTERVIEW date (distinct from
+    meeting_upload_date, which always comes from Fireflies' own dateString
+    regardless of source). If the title's date part is missing or doesn't
+    parse, meeting_date is None - deliberately NOT backfilled from
+    dateString anymore, since dateString is upload/processing time, not
+    necessarily when the interview actually happened; a wrong-but-plausible
+    guess is worse than an honest NULL here.
+
     Never raises - a malformed/missing title just means less gets parsed,
     logged as a warning, not a crash.
     """
@@ -232,7 +240,7 @@ def parse_offline_title(title: str, fallback_date_string: str):
 
     if len(parts) < 2:
         warnings.append(f"title {title!r} has fewer than 2 '_'-separated parts - interviewer/candidate left NULL")
-        return None, None, parse_meeting_date(fallback_date_string), warnings
+        return None, None, None, warnings
 
     interviewer_name = parts[0].strip() or None
     candidate_name = parts[1].strip() or None
@@ -250,13 +258,10 @@ def parse_offline_title(title: str, fallback_date_string: str):
         if meeting_date is None:
             warnings.append(
                 f"title date part {date_part!r} did not match any known format - "
-                f"falling back to Fireflies' own dateString"
+                f"meeting_date left NULL (not guessed from dateString)"
             )
     else:
-        warnings.append(f"title {title!r} has no third part for date - falling back to dateString")
-
-    if meeting_date is None:
-        meeting_date = parse_meeting_date(fallback_date_string)
+        warnings.append(f"title {title!r} has no third part for date - meeting_date left NULL")
 
     return interviewer_name, candidate_name, meeting_date, warnings
 
@@ -323,6 +328,10 @@ def write_transcript_row(transcript: dict, meeting_id: str) -> dict:
     meeting_link = transcript.get("meeting_link")
     sentences = transcript.get("sentences") or []
 
+    # meeting_upload_date always comes from Fireflies' own dateString, regardless
+    # of source - this is upload/processing time, not necessarily the interview date.
+    meeting_upload_date = parse_meeting_date(transcript.get("dateString"))
+
     # meeting_link is the ONLY signal for offline vs online now (see module
     # docstring) - a real live meeting always has it populated; an uploaded
     # audio file never does.
@@ -331,12 +340,14 @@ def write_transcript_row(transcript: dict, meeting_id: str) -> dict:
         interviewer_name, candidate_name, warnings = classify_online_participants(
             transcript.get("meeting_attendees") or []
         )
-        meeting_date = parse_meeting_date(transcript.get("dateString"))
+        # Online: the live call's date IS the interview date - same value.
+        meeting_date = meeting_upload_date
     else:
         source = "offline"
-        interviewer_name, candidate_name, meeting_date, warnings = parse_offline_title(
-            meeting_name, transcript.get("dateString")
-        )
+        interviewer_name, candidate_name, meeting_date, warnings = parse_offline_title(meeting_name)
+        # Offline: meeting_date comes ONLY from the title (interview date). If the
+        # title's date part is missing/unparseable, meeting_date stays None here -
+        # deliberately not backfilled from meeting_upload_date (see parse_offline_title).
 
     for w in warnings:
         logger.warning(f"meeting_id={meeting_id} source={source} title={meeting_name!r}: {w}")
@@ -356,10 +367,10 @@ def write_transcript_row(transcript: dict, meeting_id: str) -> dict:
 
     insert_sql = """
         INSERT INTO drt.ta_interview_transcript (
-            transcript_id, source, meeting_date, meeting_link, meeting_name,
-            interviewer_name, candidate_name, segments
+            transcript_id, source, meeting_upload_date, meeting_date, meeting_link,
+            meeting_name, interviewer_name, candidate_name, segments
         ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s
         );
     """
 
@@ -369,6 +380,7 @@ def write_transcript_row(transcript: dict, meeting_id: str) -> dict:
         cur.execute(insert_sql, (
             transcript_id,
             source,
+            meeting_upload_date,
             meeting_date,
             meeting_link,
             meeting_name,
